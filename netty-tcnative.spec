@@ -58,7 +58,7 @@ patch=`mktemp`
 sed "s;@PATH@;%{_libdir}/%{name};g" < %{PATCH1} > $patch
 patch -p1 < $patch
 %patch2 -p1
-%patch3 -p1 -b .openssl
+#% patch3 -p1 -b .openssl
 
 
 %build
