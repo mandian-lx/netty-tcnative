@@ -1,0 +1,718 @@
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/ssl.c.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/ssl.c
+@@ -237,17 +237,21 @@
+         return 0;
+ }
+ 
++#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
++ static void init_bio_methods(void);
++ static void free_bio_methods(void);
++#endif
+ 
+ TCN_IMPLEMENT_CALL(jint, SSL, version)(TCN_STDARGS)
+ {
+     UNREFERENCED_STDARGS;
+-    return OPENSSL_VERSION_NUMBER;
++    return OpenSSL_version_num();
+ }
+ 
+ TCN_IMPLEMENT_CALL(jstring, SSL, versionString)(TCN_STDARGS)
+ {
+     UNREFERENCED(o);
+-    return AJP_TO_JSTRING(OPENSSL_VERSION_TEXT);
++    return AJP_TO_JSTRING(OpenSSL_version(OPENSSL_VERSION));
+ }
+ 
+ /*
+@@ -288,7 +292,13 @@
+ #if OPENSSL_VERSION_NUMBER >= 0x00907001
+     CRYPTO_cleanup_all_ex_data();
+ #endif
+-    ERR_remove_state(0);
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++    ERR_remove_thread_state(NULL);
++#endif
++#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
++    free_bio_methods();
++#endif
++
+ 
+     /* Don't call ERR_free_strings here; ERR_load_*_strings only
+      * actually load the error strings once per process due to static
+@@ -360,11 +370,16 @@
+ #endif
+ }
+ 
++static void ssl_set_thread_id(CRYPTO_THREADID *id)
++{
++    CRYPTO_THREADID_set_numeric(id, ssl_thread_id());
++}
++
+ static apr_status_t ssl_thread_cleanup(void *data)
+ {
+     UNREFERENCED(data);
+     CRYPTO_set_locking_callback(NULL);
+-    CRYPTO_set_id_callback(NULL);
++    CRYPTO_THREADID_set_callback(NULL);
+     CRYPTO_set_dynlock_create_callback(NULL);
+     CRYPTO_set_dynlock_lock_callback(NULL);
+     CRYPTO_set_dynlock_destroy_callback(NULL);
+@@ -505,12 +520,14 @@
+     if (file == NULL)
+         file = RAND_file_name(buffer, sizeof(buffer));
+     if (file) {
++#ifdef HAVE_SSL_RAND_EGD
+         if (strncmp(file, "egd:", 4) == 0) {
+             if ((n = RAND_egd(file + 4)) > 0)
+                 return n;
+             else
+                 return -1;
+         }
++#endif
+         if ((n = RAND_load_file(file, -1)) > 0)
+             return n;
+     }
+@@ -529,9 +546,11 @@
+ 
+     if (file == NULL)
+         file = RAND_file_name(buffer, sizeof(buffer));
++#ifdef HAVE_SSL_RAND_EGD
+     else if ((n = RAND_egd(file)) > 0) {
+         return 0;
+     }
++#endif
+     if (file == NULL || !RAND_write_file(file))
+         return 0;
+     else
+@@ -631,10 +650,16 @@
+         ssl_initialized = 0;
+         return (jint)APR_EINVAL;
+     }
++    
++#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
++
+     /* We must register the library in full, to ensure our configuration
+      * code can successfully test the SSL environment.
+      */
+     CRYPTO_malloc_init();
++#else
++    OPENSSL_malloc_init();
++#endif
+     ERR_load_crypto_strings();
+     SSL_load_error_strings();
+     SSL_library_init();
+@@ -689,6 +714,10 @@
+     /* For SSL_get_app_data2() at request time */
+     SSL_init_app_data2_idx();
+ 
++#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
++    init_bio_methods();
++#endif
++
+     SSL_TMP_KEYS_INIT(r);
+     if (r) {
+         TCN_FREE_CSTRING(engine);
+@@ -806,10 +835,11 @@
+ 
+ void SSL_BIO_close(BIO *bi)
+ {
++    BIO_JAVA *j = NULL;
+     if (bi == NULL)
+         return;
+-    if (bi->ptr != NULL && (bi->flags & SSL_BIO_FLAG_CALLBACK)) {
+-        BIO_JAVA *j = (BIO_JAVA *)bi->ptr;
++    j = (BIO_JAVA *)BIO_get_data(bi);
++    if (j != NULL && BIO_test_flags(bi, SSL_BIO_FLAG_CALLBACK)) {
+         j->refcount--;
+         if (j->refcount == 0) {
+             if (j->pool)
+@@ -824,10 +854,12 @@
+ 
+ void SSL_BIO_doref(BIO *bi)
+ {
++    BIO_JAVA *j = NULL;
+     if (bi == NULL)
+         return;
+-    if (bi->ptr != NULL && (bi->flags & SSL_BIO_FLAG_CALLBACK)) {
+-        BIO_JAVA *j = (BIO_JAVA *)bi->ptr;
++    j = (BIO_JAVA *)BIO_get_data(bi);
++    if (j != NULL && BIO_test_flags(bi, SSL_BIO_FLAG_CALLBACK)) {
++        BIO_JAVA *j = BIO_get_data(bi);
+         j->refcount++;
+     }
+ }
+@@ -835,16 +867,23 @@
+ 
+ static int jbs_new(BIO *bi)
+ {
+-    BIO_JAVA *j;
++    BIO_JAVA *j = NULL;
+ 
+     if ((j = OPENSSL_malloc(sizeof(BIO_JAVA))) == NULL)
+         return 0;
+     j->pool      = NULL;
+     j->refcount  = 1;
+-    bi->shutdown = 1;
+-    bi->init     = 0;
++    BIO_set_shutdown(bi, 1);
++    BIO_set_init(bi, 0);
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++    /* No setter method for OpenSSL 1.1.0 available,
++     * but I can't find any functional use of the
++     * "num" field there either.
++     */
+     bi->num      = -1;
+-    bi->ptr      = (char *)j;
++#endif
++    BIO_set_data(bi, (void *)j);
++
+ 
+     return 1;
+ }
+@@ -852,32 +891,31 @@
+ static int jbs_free(BIO *bi)
+ {
+     JNIEnv *e = NULL;
+-    BIO_JAVA *j;
++    BIO_JAVA *j = NULL;
+ 
+     if (bi == NULL)
+         return 0;
+-    if (bi->ptr != NULL) {
+-        j = (BIO_JAVA *)bi->ptr;
+-        if (bi->init) {
+-            bi->init = 0;
++    j = (BIO_JAVA *)BIO_get_data(bi);
++    if (j != NULL) {
++        if (BIO_get_init(bi)) {
++            BIO_set_init(bi, 0);
+             tcn_get_java_env(&e);
+             TCN_UNLOAD_CLASS(e, j->cb.obj);
+         }
+-        OPENSSL_free(bi->ptr);
++        OPENSSL_free(j);
+     }
+-    bi->ptr = NULL;
++    BIO_set_data(bi, NULL);
+     return 1;
+ }
+ 
+ static int jbs_write(BIO *b, const char *in, int inl)
+ {
+     jint ret = -1;
+-    JNIEnv *e = NULL;
+-    BIO_JAVA *j;
+-    jbyteArray jb;
+ 
+-    if (b->init && in != NULL) {
+-        j = (BIO_JAVA *)b->ptr;
++    if (BIO_get_init(b) && in != NULL) {
++        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
++        JNIEnv *e = NULL;
++        jbyteArray jb;
+         tcn_get_java_env(&e);
+         jb = (*e)->NewByteArray(e, inl);
+         if (!(*e)->ExceptionOccurred(e)) {
+@@ -898,13 +936,12 @@
+ static int jbs_read(BIO *b, char *out, int outl)
+ {
+     jint ret = 0;
+-    JNIEnv *e = NULL;
+-    BIO_JAVA *j;
+-    jbyteArray jb;
+     jbyte *jout;
+ 
+-    if (b->init && out != NULL) {
+-        j = (BIO_JAVA *)b->ptr;
++    if (BIO_get_init(b) && out != NULL) {
++        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
++        JNIEnv *e = NULL;
++        jbyteArray jb;
+         tcn_get_java_env(&e);
+         jb = (*e)->NewByteArray(e, outl);
+         if (!(*e)->ExceptionOccurred(e)) {
+@@ -929,10 +966,10 @@
+ {
+     int ret = 0;
+     JNIEnv *e = NULL;
+-    BIO_JAVA *j;
++    BIO_JAVA *j = NULL;
+ 
+-    if (b->init && in != NULL) {
+-        j = (BIO_JAVA *)b->ptr;
++    if (BIO_get_init(b) && in != NULL) {
++        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
+         tcn_get_java_env(&e);
+         ret = (*e)->CallIntMethod(e, j->cb.obj,
+                                   j->cb.mid[2],
+@@ -945,12 +982,12 @@
+ {
+     int ret = 0;
+     JNIEnv *e = NULL;
+-    BIO_JAVA *j;
++    BIO_JAVA *j = NULL;
+     jobject o;
+     int l;
+ 
+-    if (b->init && out != NULL) {
+-        j = (BIO_JAVA *)b->ptr;
++    if (BIO_get_init(b) && out != NULL) {
++        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
+         tcn_get_java_env(&e);
+         if ((o = (*e)->CallObjectMethod(e, j->cb.obj,
+                             j->cb.mid[3], (jint)(outl - 1)))) {
+@@ -982,6 +1019,7 @@
+     return ret;
+ }
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+ static BIO_METHOD jbs_methods = {
+     BIO_TYPE_FILE,
+     "Java Callback",
+@@ -994,17 +1032,41 @@
+     jbs_free,
+     NULL
+ };
++#else
++static BIO_METHOD *jbs_methods = NULL;
++
++static void init_bio_methods(void)
++{
++    jbs_methods = BIO_meth_new(BIO_TYPE_FILE, "Java Callback");
++    BIO_meth_set_write(jbs_methods, &jbs_write);
++    BIO_meth_set_read(jbs_methods, &jbs_read);
++    BIO_meth_set_puts(jbs_methods, &jbs_puts);
++    BIO_meth_set_gets(jbs_methods, &jbs_gets);
++    BIO_meth_set_ctrl(jbs_methods, &jbs_ctrl);
++    BIO_meth_set_create(jbs_methods, &jbs_new);
++    BIO_meth_set_destroy(jbs_methods, &jbs_free);
++}
++
++static void free_bio_methods(void)
++{
++    BIO_meth_free(jbs_methods);
++}
++#endif
+ 
+ static BIO_METHOD *BIO_jbs()
+ {
+-    return(&jbs_methods);
++#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
++     return(&jbs_methods);
++#else
++    return jbs_methods;
++#endif
+ }
+ 
+ TCN_IMPLEMENT_CALL(jlong, SSL, newBIO)(TCN_STDARGS, jlong pool,
+                                        jobject callback)
+ {
+     BIO *bio = NULL;
+-    BIO_JAVA *j;
++    BIO_JAVA *j = NULL;
+     jclass cls;
+ 
+     UNREFERENCED(o);
+@@ -1013,8 +1075,8 @@
+         tcn_ThrowException(e, "Create BIO failed");
+         goto init_failed;
+     }
+-    j = (BIO_JAVA *)bio->ptr;
+-    if ((j = (BIO_JAVA *)bio->ptr) == NULL) {
++    j = (BIO_JAVA *)BIO_get_data(bio);
++    if (j == NULL) {
+         tcn_ThrowException(e, "Create BIO failed");
+         goto init_failed;
+     }
+@@ -1033,8 +1095,8 @@
+     /* TODO: Check if method id's are valid */
+     j->cb.obj    = (*e)->NewGlobalRef(e, callback);
+ 
+-    bio->init  = 1;
+-    bio->flags = SSL_BIO_FLAG_CALLBACK;
++    BIO_set_init(bio, 1);
++    BIO_set_flags(bio, SSL_BIO_FLAG_CALLBACK);
+     return P2J(bio);
+ init_failed:
+     return 0;
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslcontext.c.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslcontext.c
+@@ -72,6 +72,7 @@
+     UNREFERENCED(o);
+ 
+     switch (protocol) {
++#if (OPENSSL_VERSION_NUMBER < 0x10100000L) && !defined(OPENSSL_NO_SSL2)
+         case SSL_PROTOCOL_SSLV2:
+             if (mode == SSL_MODE_CLIENT)
+                 ctx = SSL_CTX_new(SSLv2_client_method());
+@@ -79,6 +80,7 @@
+                 ctx = SSL_CTX_new(SSLv2_server_method());
+             else
+                 ctx = SSL_CTX_new(SSLv2_method());
++#endif
+         break;
+         case SSL_PROTOCOL_SSLV3:
+             if (mode == SSL_MODE_CLIENT)
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/ssl_private.h.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/ssl_private.h
+@@ -214,6 +214,25 @@
+ #define HAVE_ECC              1
+ #endif
+ 
++/* OpenSSL 1.0.2 compatibility */
++#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
++#define TLS_method SSLv23_method
++#define TLS_client_method SSLv23_client_method
++#define TLS_server_method SSLv23_server_method
++#define OPENSSL_VERSION SSLEAY_VERSION
++#define OpenSSL_version SSLeay_version
++#define OPENSSL_malloc_init CRYPTO_malloc_init
++#define X509_REVOKED_get0_serialNumber(x) x->serialNumber
++#define OpenSSL_version_num SSLeay
++#define BIO_get_init(x)       (x->init)
++#define BIO_set_init(x,v)     (x->init=v)
++#define BIO_get_data(x)       (x->ptr)
++#define BIO_set_data(x,v)     (x->ptr=v)
++#define BIO_set_shutdown(x,v) (x->shutdown=v)
++#endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
++
++
++
+ extern void *SSL_temp_keys[SSL_TMP_KEY_MAX];
+ 
+ typedef struct {
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslinfo.c.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslinfo.c
+@@ -177,20 +177,18 @@
+ 
+     for (i = 0; info_cert_dn_rec[i].fid != 0; i++) {
+         if (info_cert_dn_rec[i].fid == dnidx) {
+-            for (j = 0; j < sk_X509_NAME_ENTRY_num((STACK_OF(X509_NAME_ENTRY) *)
+-                                                   (xsname->entries)); j++) {
+-                xsne = sk_X509_NAME_ENTRY_value((STACK_OF(X509_NAME_ENTRY) *)
+-                                                (xsname->entries), j);
+-
+-                n =OBJ_obj2nid((ASN1_OBJECT *)X509_NAME_ENTRY_get_object(xsne));
++            for (j = 0; j < X509_NAME_entry_count(xsname); j++) {
++                xsne = X509_NAME_get_entry(xsname, j);
++                n = OBJ_obj2nid(X509_NAME_ENTRY_get_object(xsne));
+                 if (n == info_cert_dn_rec[i].nid && idx-- == 0) {
+-                    result = malloc(xsne->value->length + 1);
+-                    memcpy(result, xsne->value->data,
+-                                   xsne->value->length);
+-                    result[xsne->value->length] = '\0';
++                    ASN1_STRING *adata = X509_NAME_ENTRY_get_data(xsne);
++                    int len = ASN1_STRING_length(adata);
++                    result = malloc(len + 1);
++                    memcpy(result, ASN1_STRING_data(adata), len);
++                    result[len] = '\0';
+ 
+ #if APR_CHARSET_EBCDIC
+-                    ap_xlate_proto_from_ascii(result, xsne->value->length);
++                    ap_xlate_proto_from_ascii(result, len);
+ #endif /* APR_CHARSET_EBCDIC */
+                     break;
+                 }
+@@ -218,8 +216,9 @@
+         {
+             SSL_SESSION *session  = SSL_get_session(s->ssl);
+             if (session) {
+-                array = tcn_new_arrayb(e, &session->session_id[0],
+-                                       session->session_id_length);
++                unsigned int len;
++                const unsigned char *id = SSL_SESSION_get_id(session, &len);
++                array = tcn_new_arrayb(e, id, len);
+             }
+         }
+         break;
+@@ -298,8 +297,9 @@
+         {
+             SSL_SESSION *session  = SSL_get_session(s->ssl);
+             if (session) {
+-                char *hs = convert_to_hex(&session->session_id[0],
+-                                          session->session_id_length);
++                unsigned int len;
++                const unsigned char *id = SSL_SESSION_get_id(session, &len);
++                char *hs = convert_to_hex(id, len);
+                 if (hs) {
+                     value = tcn_new_string(e, hs);
+                     free(hs);
+@@ -395,14 +395,22 @@
+                     }
+                 break;
+                 case SSL_INFO_CLIENT_A_SIG:
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+                     nid = OBJ_obj2nid((ASN1_OBJECT *)xs->cert_info->signature->algorithm);
++#else
++                    nid = X509_get_signature_nid(xs);
++#endif
+                     if (nid == NID_undef)
+                         value = tcn_new_string(e, "UNKNOWN");
+                     else
+                         value = tcn_new_string(e, OBJ_nid2ln(nid));
+                 break;
+                 case SSL_INFO_CLIENT_A_KEY:
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+                     nid = OBJ_obj2nid((ASN1_OBJECT *)xs->cert_info->key->algor->algorithm);
++#else
++                    nid = X509_get_signature_type(xs);
++#endif
+                     if (nid == NID_undef)
+                         value = tcn_new_string(e, "UNKNOWN");
+                     else
+@@ -444,14 +452,22 @@
+                     }
+                 break;
+                 case SSL_INFO_SERVER_A_SIG:
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+                     nid = OBJ_obj2nid((ASN1_OBJECT *)xs->cert_info->signature->algorithm);
++#else
++                    nid = X509_get_signature_nid(xs);
++#endif
+                     if (nid == NID_undef)
+                         value = tcn_new_string(e, "UNKNOWN");
+                     else
+                         value = tcn_new_string(e, OBJ_nid2ln(nid));
+                 break;
+                 case SSL_INFO_SERVER_A_KEY:
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+                     nid = OBJ_obj2nid((ASN1_OBJECT *)xs->cert_info->key->algor->algorithm);
++#else
++                    nid = X509_get_signature_type(xs);
++#endif
+                     if (nid == NID_undef)
+                         value = tcn_new_string(e, "UNKNOWN");
+                     else
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslnetwork.c.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslnetwork.c
+@@ -410,7 +410,7 @@
+             rv  = apr_get_netos_error();
+             i   = SSL_get_error(con->ssl, s);
+             /* Special case if the "close notify" alert send by peer */
+-            if (s == 0 && (con->ssl->shutdown & SSL_RECEIVED_SHUTDOWN)) {
++            if (s == 0 && (SSL_get_shutdown(con->ssl) & SSL_RECEIVED_SHUTDOWN)) {
+                 con->shutdown_type = SSL_SHUTDOWN_TYPE_STANDARD;
+                 return APR_EOF;
+             }
+@@ -644,10 +644,19 @@
+     if (retVal <= 0)
+         return APR_EGENERAL;
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+     if (SSL_get_state(con->ssl) != SSL_ST_OK) {
++#else
++    if (SSL_get_state(con->ssl) != TLS_ST_OK) {
++#endif
+         return APR_EGENERAL;
+     }
++#if OPENSSL_VERSION_NUMBER < 0x10002000L
++#if OPENSSL_VERSION_NUMBER >= 0x1000100fL
++    SSL_set_state(con->ssl, SSL_ST_ACCEPT);
++#else
+     con->ssl->state = SSL_ST_ACCEPT;
++#endif
+ 
+     apr_socket_timeout_get(con->sock, &timeout);
+     ecode = SSL_ERROR_WANT_READ;
+@@ -670,6 +679,7 @@
+     if (SSL_get_state(con->ssl) != SSL_ST_OK) {
+         return APR_EGENERAL;
+     }
++#endif
+ 
+     return APR_SUCCESS;
+ }
+--- netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslutils.c.openssl
++++ netty-tcnative-netty-tcnative-1.1.30.Fork2/src/main/c/sslutils.c
+@@ -255,25 +255,27 @@
+ static DH *get_dh(int idx)
+ {
+     DH *dh;
++    const BIGNUM *p, *g;
+ 
+     if ((dh = DH_new()) == NULL)
+         return NULL;
+     switch (idx) {
+         case SSL_TMP_KEY_DH_512:
+-            dh->p = BN_bin2bn(dh0512_p, sizeof(dh0512_p), NULL);
++            DH_set0_pqg(dh, BN_bin2bn(dh0512_p, sizeof(dh0512_p), NULL), NULL, NULL);
+         break;
+         case SSL_TMP_KEY_DH_1024:
+-            dh->p = BN_bin2bn(dh1024_p, sizeof(dh1024_p), NULL);
++            DH_set0_pqg(dh, BN_bin2bn(dh1024_p, sizeof(dh1024_p), NULL), NULL, NULL);
+         break;
+         case SSL_TMP_KEY_DH_2048:
+-            dh->p = BN_bin2bn(dh2048_p, sizeof(dh2048_p), NULL);
++            DH_set0_pqg(dh, BN_bin2bn(dh2048_p, sizeof(dh2048_p), NULL), NULL, NULL);
+         break;
+         case SSL_TMP_KEY_DH_4096:
+-            dh->p = BN_bin2bn(dh4096_p, sizeof(dh2048_p), NULL);
++            DH_set0_pqg(dh, BN_bin2bn(dh4096_p, sizeof(dh2048_p), NULL), NULL, NULL);
+         break;
+     }
+-    dh->g = BN_bin2bn(dhxxx2_g, sizeof(dhxxx2_g), NULL);
+-    if ((dh->p == NULL) || (dh->g == NULL)) {
++    DH_set0_pqg(dh, NULL, NULL, BN_bin2bn(dhxxx2_g, sizeof(dhxxx2_g), NULL));
++    DH_get0_pqg(dh, &p, NULL, &g);
++    if ((p == NULL) || (g == NULL)) {
+         DH_free(dh);
+         return NULL;
+     }
+@@ -416,9 +418,12 @@
+     X509 *x509;
+     unsigned long err;
+     int n;
+-    STACK_OF(X509) *extra_certs;
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+     if ((bio = BIO_new(BIO_s_file_internal())) == NULL)
++#else
++    if ((bio = BIO_new(BIO_s_file())) == NULL)
++#endif
+         return -1;
+     if (BIO_read_filename(bio, file) <= 0) {
+         BIO_free(bio);
+@@ -433,11 +438,14 @@
+         X509_free(x509);
+     }
+     /* free a perhaps already configured extra chain */
+-    extra_certs = SSL_CTX_get_extra_certs(ctx);
+-    if (extra_certs != NULL) {
+-        sk_X509_pop_free(extra_certs, X509_free);
+-        SSL_CTX_set_extra_certs(ctx,NULL);
++#if OPENSSL_VERSION_NUMBER >= 0x1000100fL
++    SSL_CTX_clear_extra_chain_certs(ctx);
++#else
++    if (ctx->extra_certs != NULL) {
++        sk_X509_pop_free(ctx->extra_certs, X509_free);
++        ctx->extra_certs = NULL;
+     }
++#endif
+     /* create new extra chain by loading the certs */
+     n = 0;
+     while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+@@ -464,18 +472,20 @@
+ static int ssl_X509_STORE_lookup(X509_STORE *store, int yype,
+                                  X509_NAME *name, X509_OBJECT *obj)
+ {
+-    X509_STORE_CTX ctx;
++    X509_STORE_CTX *ctx;
+     int rc;
+ 
+-    X509_STORE_CTX_init(&ctx, store, NULL, NULL);
+-    rc = X509_STORE_get_by_subject(&ctx, yype, name, obj);
+-    X509_STORE_CTX_cleanup(&ctx);
++    ctx = X509_STORE_CTX_new();
++    X509_STORE_CTX_init(ctx, store, NULL, NULL);
++    rc = X509_STORE_get_by_subject(ctx, yype, name, obj);
++    X509_STORE_CTX_cleanup(ctx);
++    X509_STORE_CTX_free(ctx);
+     return rc;
+ }
+ 
+ static int ssl_verify_CRL(int ok, X509_STORE_CTX *ctx, tcn_ssl_conn_t *con)
+ {
+-    X509_OBJECT obj;
++    X509_OBJECT *obj;
+     X509_NAME *subject, *issuer;
+     X509 *cert;
+     X509_CRL *crl;
+@@ -524,10 +534,10 @@
+      * Try to retrieve a CRL corresponding to the _subject_ of
+      * the current certificate in order to verify it's integrity.
+      */
+-    memset((char *)&obj, 0, sizeof(obj));
++    obj = X509_OBJECT_new();
+     rc = ssl_X509_STORE_lookup(con->ctx->crl,
+-                               X509_LU_CRL, subject, &obj);
+-    crl = obj.data.crl;
++                               X509_LU_CRL, subject, obj);
++    crl = X509_OBJECT_get0_X509_CRL(obj);
+ 
+     if ((rc > 0) && crl) {
+         /*
+@@ -545,7 +555,7 @@
+         if (rc <= 0) {
+             /* TODO: Log Invalid signature on CRL */
+             X509_STORE_CTX_set_error(ctx, X509_V_ERR_CRL_SIGNATURE_FAILURE);
+-            X509_OBJECT_free_contents(&obj);
++            X509_OBJECT_free(obj);
+             return 0;
+         }
+ 
+@@ -559,30 +569,30 @@
+ 
+             X509_STORE_CTX_set_error(ctx,
+                                      X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD);
+-            X509_OBJECT_free_contents(&obj);
++            X509_OBJECT_free(obj);
+             return 0;
+         }
+ 
+         if (i < 0) {
+             /* TODO: Log Found CRL is expired */
+             X509_STORE_CTX_set_error(ctx, X509_V_ERR_CRL_HAS_EXPIRED);
+-            X509_OBJECT_free_contents(&obj);
++            X509_OBJECT_free(obj);
+ 
+             return 0;
+         }
+ 
+-        X509_OBJECT_free_contents(&obj);
++        X509_OBJECT_free(obj);
+     }
+ 
+     /*
+      * Try to retrieve a CRL corresponding to the _issuer_ of
+      * the current certificate in order to check for revocation.
+      */
+-    memset((char *)&obj, 0, sizeof(obj));
++    obj = X509_OBJECT_new();
+     rc = ssl_X509_STORE_lookup(con->ctx->crl,
+-                               X509_LU_CRL, issuer, &obj);
++                               X509_LU_CRL, issuer, obj);
+ 
+-    crl = obj.data.crl;
++    crl = X509_OBJECT_get0_X509_CRL(obj);
+     if ((rc > 0) && crl) {
+         /*
+          * Check if the current certificate is revoked by this CRL
+@@ -593,17 +603,21 @@
+             X509_REVOKED *revoked =
+                 sk_X509_REVOKED_value(X509_CRL_get_REVOKED(crl), i);
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+             ASN1_INTEGER *sn = revoked->serialNumber;
++#else
++            ASN1_INTEGER *sn = X509_REVOKED_get0_serialNumber(revoked);
++#endif
+ 
+             if (!ASN1_INTEGER_cmp(sn, X509_get_serialNumber(cert))) {
+                 X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REVOKED);
+-                X509_OBJECT_free_contents(&obj);
++                X509_OBJECT_free(obj);
+ 
+                 return 0;
+             }
+         }
+ 
+-        X509_OBJECT_free_contents(&obj);
++        X509_OBJECT_free(obj);
+     }
+ 
+     return ok;
+@@ -718,8 +732,13 @@
+     if ((where & SSL_CB_ACCEPT_LOOP) && con->reneg_state == RENEG_REJECT) {
+         int state = SSL_get_state(ssl);
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
+         if (state == SSL3_ST_SR_CLNT_HELLO_A
+-            || state == SSL23_ST_SR_CLNT_HELLO_A) {
++            || state == SSL23_ST_SR_CLNT_HELLO_A
++#else
++        if (state == TLS_ST_SR_CLNT_HELLO
++#endif
++           ) {
+             con->reneg_state = RENEG_ABORT;
+             /* XXX: rejecting client initiated renegotiation
+              */
