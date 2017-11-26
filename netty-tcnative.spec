@@ -1,19 +1,19 @@
 %{?_javapackages_macros:%_javapackages_macros}
+
 %global namedreltag .Fork2
 %global namedversion %{version}%{?namedreltag}
 
 Name:           netty-tcnative
 Version:        1.1.30
-Release:        6%{?dist}
+Release:        8.1
 Summary:        Fork of Tomcat Native with improved OpenSSL and mavenized build
+Group:          Development/Java
 License:        ASL 2.0
-Group:		Development/Java
 URL:            https://github.com/netty/netty/wiki/Forked-Tomcat-Native
 Source0:        https://github.com/netty/netty-tcnative/archive/%{name}-%{namedversion}.tar.gz
 Source1:        CheckLibrary.java
 Patch1:         fixLibNames.patch.in
 Patch2:         i388aprFix.patch
-Patch3:         %{name}-1.1.30-openssl.patch
 
 BuildRequires:  maven-local
 BuildRequires:  autoconf
@@ -21,7 +21,11 @@ BuildRequires:  automake
 BuildRequires:  libtool
 BuildRequires:  glibc-devel
 BuildRequires:  apr-devel
+%if 0%{?fedora} >= 26
+BuildRequires:  compat-openssl10-devel
+%else
 BuildRequires:  openssl-devel
+%endif
 BuildRequires:  maven-antrun-plugin
 BuildRequires:  maven-hawtjni-plugin
 BuildRequires:  maven-plugin-build-helper
@@ -39,9 +43,9 @@ contributed by Twitter, Inc, such as:
  *  Simplified distribution and linkage of native library
  *  Complete mavenization of the project
  *  Improved OpenSSL support
-To minimize the maintenance burden, we create a dedicated branch for each
-stable upstream release and apply our own changes on top of it, while
-keeping the number of maintained branches to minimum
+To minimize the maintenance burden, we create a dedicated branch for each stable
+upstream release and apply our own changes on top of it, while keeping the
+number of maintained branches to minimum
 
 
 %package javadoc
@@ -58,11 +62,9 @@ patch=`mktemp`
 sed "s;@PATH@;%{_libdir}/%{name};g" < %{PATCH1} > $patch
 patch -p1 < $patch
 %patch2 -p1
-%patch3 -p1 -b .openssl
 
 
 %build
-%setup_compile_flags
 %mvn_build -f
 
 %install
@@ -86,6 +88,12 @@ javac -d . -cp $RPM_BUILD_ROOT%{_jnidir}/%{name}/%{name}.jar %{SOURCE1}
 %files javadoc -f .mfiles-javadoc
 
 %changelog
+* Thu Aug 03 2017 Fedora Release Engineering <releng@fedoraproject.org> - 1.1.30-8
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_27_Binutils_Mass_Rebuild
+
+* Wed Jul 26 2017 Fedora Release Engineering <releng@fedoraproject.org> - 1.1.30-7
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_27_Mass_Rebuild
+
 * Fri Feb 10 2017 Fedora Release Engineering <releng@fedoraproject.org> - 1.1.30-6
 - Rebuilt for https://fedoraproject.org/wiki/Fedora_26_Mass_Rebuild
 
@@ -109,3 +117,4 @@ javac -d . -cp $RPM_BUILD_ROOT%{_jnidir}/%{name}/%{name}.jar %{SOURCE1}
 
 * Thu Jan 29 2015 Jiri Vanek <jvanek@redhat.com> - 1.1.30-0
 - initial build
+
